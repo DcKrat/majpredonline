@@ -7,12 +7,13 @@ import { getFirestore, collection, addDoc, getDocs } from "firebase/firestore";
 import { getAuth, onAuthStateChanged, signInWithEmailAndPassword, signOut } from "firebase/auth";
 
 const firebaseConfig = {
-  apiKey: "YOUR_API_KEY",
-  authDomain: "YOUR_AUTH_DOMAIN",
-  projectId: "YOUR_PROJECT_ID",
-  storageBucket: "YOUR_STORAGE_BUCKET",
-  messagingSenderId: "YOUR_MESSAGING_SENDER_ID",
-  appId: "YOUR_APP_ID"
+  apiKey: "AIzaSyDao_tTRmfyXmmE2pQ9SyMVoF7BrmSUHcc",
+  authDomain: "majpred.firebaseapp.com",
+  projectId: "majpred",
+  storageBucket: "majpred.firebasestorage.app",
+  messagingSenderId: "143505491426",
+  appId: "1:143505491426:web:213f6019ee3993a83a65bb",
+  measurementId: "G-ZT2BKWCB0P"
 };
 
 const ADMIN_UID = "1lIJdWqSyBhVVj3TFDEf4YMgDjY2";
