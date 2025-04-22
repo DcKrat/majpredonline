@@ -1,5 +1,5 @@
-// Majestic RP Predictor — с обучением на общей истории всех пользователей
-import React, { useState, useEffect } from "react";
+// Majestic RP Predictor — стабильная версия с авто-компиляцией модели и защитой от двойного обучения
+import React, { useState, useEffect, useRef } from "react";
 import * as tf from "@tensorflow/tfjs";
 import { BarChart, Bar, XAxis, Tooltip, ResponsiveContainer, Cell } from "recharts";
 import { initializeApp } from "firebase/app";
@@ -15,8 +15,6 @@ const firebaseConfig = {
   appId: "1:143505491426:web:213f6019ee3993a83a65bb",
   measurementId: "G-ZT2BKWCB0P"
 };
-
-const ADMIN_UID = "1lIJdWqSyBhVVj3TFDEf4YMgDjY2";
 
 const app = initializeApp(firebaseConfig);
 const db = getFirestore(app);
@@ -36,6 +34,7 @@ export default function MajesticPredictor() {
   const [depth] = useState(50);
   const [totalPredictions, setTotalPredictions] = useState(0);
   const [correctPredictions, setCorrectPredictions] = useState(0);
+  const trainingRef = useRef(false);
 
   useEffect(() => {
     onAuthStateChanged(auth, (currentUser) => {
@@ -48,7 +47,7 @@ export default function MajesticPredictor() {
     const loadOrCreateModel = async () => {
       try {
         const loadedModel = await tf.loadLayersModel("indexeddb://majestic-rp-model-multi");
-        if (loadedModel.inputs[0].shape[1] !== depth) throw new Error("Модель несовместима");
+        loadedModel.compile({ optimizer: "adam", loss: "categoricalCrossentropy" });
         setModel(loadedModel);
       } catch {
         const newModel = tf.sequential();
@@ -71,13 +70,18 @@ export default function MajesticPredictor() {
   };
 
   const trainModel = async (input, targetIndex) => {
-    if (!model) return;
-    const inputTensor = tf.tensor2d([input]);
-    const target = new Array(4).fill(0);
-    target[targetIndex] = 1;
-    const outputTensor = tf.tensor2d([target]);
-    await model.fit(inputTensor, outputTensor, { epochs: 3 });
-    await model.save("indexeddb://majestic-rp-model-multi");
+    if (!model || trainingRef.current) return;
+    trainingRef.current = true;
+    try {
+      const inputTensor = tf.tensor2d([input]);
+      const target = new Array(4).fill(0);
+      target[targetIndex] = 1;
+      const outputTensor = tf.tensor2d([target]);
+      await model.fit(inputTensor, outputTensor, { epochs: 3 });
+      await model.save("indexeddb://majestic-rp-model-multi");
+    } finally {
+      trainingRef.current = false;
+    }
   };
 
   const predictForward = async () => {
@@ -157,7 +161,7 @@ export default function MajesticPredictor() {
 
   return (
     <div style={{ fontFamily: "sans-serif", padding: "1rem" }}>
-      <h1>🎯 Majestic RP Predictor (Обновлённый)</h1>
+      <h1>🎯 Majestic RP Predictor (Стабильная версия)</h1>
       <p>👤 Пользователь: {user.email} <button onClick={signOutUser}>Выйти</button></p>
       <p>🎯 Точность предсказаний: {totalPredictions > 0 ? ((correctPredictions / totalPredictions) * 100).toFixed(1) : 0}%</p>
 
