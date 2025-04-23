@@ -1,4 +1,4 @@
-// Majestic RP Predictor — с анализом невыпадений каждого поля
+// Majestic RP Predictor — версия с GRU и анализом невыпадений
 import React, { useState, useEffect, useRef } from "react";
 import * as tf from "@tensorflow/tfjs";
 import { BarChart, Bar, XAxis, Tooltip, ResponsiveContainer, Cell } from "recharts";
@@ -47,13 +47,17 @@ export default function MajesticPredictor() {
     if (!user) return;
     const loadOrCreateModel = async () => {
       try {
-        const loadedModel = await tf.loadLayersModel("indexeddb://majestic-rp-model-miss-aware");
+        const loadedModel = await tf.loadLayersModel("indexeddb://majestic-rp-model-gru");
         loadedModel.compile({ optimizer: "adam", loss: "categoricalCrossentropy" });
         setModel(loadedModel);
       } catch {
-        const newModel = tf.sequential();
-        newModel.add(tf.layers.dense({ inputShape: [depth + 4], units: 32, activation: "relu" }));
-        newModel.add(tf.layers.dense({ units: 4, activation: "softmax" }));
+        const inputLength = depth;
+        const modelInput = tf.input({ shape: [inputLength, 1] });
+        const gru = tf.layers.gru({ units: 32, returnSequences: false }).apply(modelInput);
+        const extraInput = tf.input({ shape: [4] });
+        const merged = tf.layers.concatenate().apply([gru, extraInput]);
+        const output = tf.layers.dense({ units: 4, activation: "softmax" }).apply(merged);
+        const newModel = tf.model({ inputs: [modelInput, extraInput], outputs: output });
         newModel.compile({ optimizer: "adam", loss: "categoricalCrossentropy" });
         setModel(newModel);
       }
@@ -70,16 +74,17 @@ export default function MajesticPredictor() {
     });
   };
 
-  const trainModel = async (input, targetIndex) => {
+  const trainModel = async (inputSeq, extraInput, targetIndex) => {
     if (!model || trainingRef.current) return;
     trainingRef.current = true;
     try {
-      const inputTensor = tf.tensor2d([input]);
+      const xs1 = tf.tensor3d([inputSeq.map(i => [i])]);
+      const xs2 = tf.tensor2d([extraInput]);
       const target = new Array(4).fill(0);
       target[targetIndex] = 1;
-      const outputTensor = tf.tensor2d([target]);
-      await model.fit(inputTensor, outputTensor, { epochs: 3 });
-      await model.save("indexeddb://majestic-rp-model-miss-aware");
+      const ys = tf.tensor2d([target]);
+      await model.fit([xs1, xs2], ys, { epochs: 3 });
+      await model.save("indexeddb://majestic-rp-model-gru");
     } finally {
       trainingRef.current = false;
     }
@@ -87,30 +92,23 @@ export default function MajesticPredictor() {
 
   const predictForward = async () => {
     if (!model || session.length < depth) return;
-    const input = [
-      ...session.slice(-depth).map(f => fieldToIndex[f] / 3),
-      ...missCounts.map(c => Math.min(c / 20, 1))
-    ];
-    const inputTensor = tf.tensor2d([input]);
-    const result = await model.predict(inputTensor).data();
+    const inputSeq = session.slice(-depth).map(f => fieldToIndex[f] / 3);
+    const missInput = missCounts.map(c => Math.min(c / 20, 1));
+    const xs1 = tf.tensor3d([inputSeq.map(i => [i])]);
+    const xs2 = tf.tensor2d([missInput]);
+    const result = await model.predict([xs1, xs2]).data();
     setPredictions(result);
   };
 
   const addResult = async (selectedField) => {
     const newSession = [...session, selectedField];
     setSession(newSession);
-
-    const updatedMissCounts = missCounts.map((c, i) =>
-      i === fieldToIndex[selectedField] ? 0 : c + 1
-    );
+    const updatedMissCounts = missCounts.map((c, i) => (i === fieldToIndex[selectedField] ? 0 : c + 1));
     setMissCounts(updatedMissCounts);
-
     if (newSession.length >= depth) {
-      const input = [
-        ...newSession.slice(-depth).map(f => fieldToIndex[f] / 3),
-        ...updatedMissCounts.map(c => Math.min(c / 20, 1))
-      ];
-      await trainModel(input, fieldToIndex[selectedField]);
+      const inputSeq = newSession.slice(-depth).map(f => fieldToIndex[f] / 3);
+      const extraInput = updatedMissCounts.map(c => Math.min(c / 20, 1));
+      await trainModel(inputSeq, extraInput, fieldToIndex[selectedField]);
       await saveToFirestore({ session: newSession });
       await predictForward();
       if (predictions) {
@@ -125,64 +123,51 @@ export default function MajesticPredictor() {
 
   const trainFromAllSessions = async () => {
     const snapshot = await getDocs(collection(db, "sessions"));
-    const allInputs = [];
-    const allTargets = [];
-
+    const allXs1 = [], allXs2 = [], allYs = [];
     snapshot.forEach(doc => {
       const s = doc.data().session;
       if (!Array.isArray(s) || s.length < depth + 1) return;
-
-      let counts = [0, 0, 0, 0];
+      let miss = [0, 0, 0, 0];
       for (let i = depth; i < s.length; i++) {
-        const inputSeq = s.slice(i - depth, i).map(f => fieldToIndex[f] / 3);
-        const current = fieldToIndex[s[i]];
-        const missInput = counts.map(c => Math.min(c / 20, 1));
-        const input = [...inputSeq, ...missInput];
-
+        const seq = s.slice(i - depth, i).map(f => fieldToIndex[f] / 3);
+        const extra = miss.map(c => Math.min(c / 20, 1));
         const target = new Array(4).fill(0);
-        target[current] = 1;
-
-        allInputs.push(input);
-        allTargets.push(target);
-
-        counts = counts.map((c, idx) => (idx === current ? 0 : c + 1));
+        const idx = fieldToIndex[s[i]];
+        target[idx] = 1;
+        allXs1.push(seq.map(v => [v]));
+        allXs2.push(extra);
+        allYs.push(target);
+        miss = miss.map((c, j) => (j === idx ? 0 : c + 1));
       }
     });
-
-    if (model && allInputs.length > 0) {
-      const xs = tf.tensor2d(allInputs);
-      const ys = tf.tensor2d(allTargets);
-      await model.fit(xs, ys, { epochs: 5 });
-      await model.save("indexeddb://majestic-rp-model-miss-aware");
-      alert("Модель обучена с учётом невыпадений!");
+    if (model && allXs1.length) {
+      const xs1 = tf.tensor3d(allXs1);
+      const xs2 = tf.tensor2d(allXs2);
+      const ys = tf.tensor2d(allYs);
+      await model.fit([xs1, xs2], ys, { epochs: 5 });
+      await model.save("indexeddb://majestic-rp-model-gru");
+      alert("Модель GRU обучена!");
     }
   };
 
-  const signIn = () => {
-    signInWithEmailAndPassword(auth, email, password).catch(console.error);
-  };
+  const signIn = () => signInWithEmailAndPassword(auth, email, password).catch(console.error);
+  const signOutUser = () => signOut(auth);
 
-  const signOutUser = () => {
-    signOut(auth);
-  };
-
-  if (!user) {
-    return (
-      <div style={{ padding: 20 }}>
-        <h2>🔐 Вход</h2>
-        <input placeholder="Email" value={email} onChange={e => setEmail(e.target.value)} />
-        <input placeholder="Пароль" type="password" value={password} onChange={e => setPassword(e.target.value)} />
-        <button onClick={signIn}>Войти</button>
-      </div>
-    );
-  }
+  if (!user) return (
+    <div style={{ padding: 20 }}>
+      <h2>🔐 Вход</h2>
+      <input placeholder="Email" value={email} onChange={e => setEmail(e.target.value)} />
+      <input placeholder="Пароль" type="password" value={password} onChange={e => setPassword(e.target.value)} />
+      <button onClick={signIn}>Войти</button>
+    </div>
+  );
 
   const sessionData = session.map((f, i) => ({ name: `${i + 1}`, value: 1, color: barColors[f], label: f }));
   const predictionData = predictions ? fields.map((f, i) => ({ name: f, value: +(predictions[i] * 100).toFixed(1) })) : [];
 
   return (
     <div style={{ fontFamily: "sans-serif", padding: "1rem" }}>
-      <h1>🎯 Majestic RP Predictor (Невыпадения + обучение)</h1>
+      <h1>🎯 Majestic RP Predictor (GRU версия)</h1>
       <p>👤 Пользователь: {user.email} <button onClick={signOutUser}>Выйти</button></p>
       <p>🎯 Точность предсказаний: {totalPredictions > 0 ? ((correctPredictions / totalPredictions) * 100).toFixed(1) : 0}%</p>
 
@@ -225,4 +210,3 @@ export default function MajesticPredictor() {
     </div>
   );
 }
-
