@@ -1,4 +1,4 @@
-// Majestic RP Predictor — стабильная версия с авто-компиляцией модели и защитой от двойного обучения
+// Majestic RP Predictor — с анализом невыпадений каждого поля
 import React, { useState, useEffect, useRef } from "react";
 import * as tf from "@tensorflow/tfjs";
 import { BarChart, Bar, XAxis, Tooltip, ResponsiveContainer, Cell } from "recharts";
@@ -35,6 +35,7 @@ export default function MajesticPredictor() {
   const [totalPredictions, setTotalPredictions] = useState(0);
   const [correctPredictions, setCorrectPredictions] = useState(0);
   const trainingRef = useRef(false);
+  const [missCounts, setMissCounts] = useState([0, 0, 0, 0]);
 
   useEffect(() => {
     onAuthStateChanged(auth, (currentUser) => {
@@ -46,12 +47,12 @@ export default function MajesticPredictor() {
     if (!user) return;
     const loadOrCreateModel = async () => {
       try {
-        const loadedModel = await tf.loadLayersModel("indexeddb://majestic-rp-model-multi");
+        const loadedModel = await tf.loadLayersModel("indexeddb://majestic-rp-model-miss-aware");
         loadedModel.compile({ optimizer: "adam", loss: "categoricalCrossentropy" });
         setModel(loadedModel);
       } catch {
         const newModel = tf.sequential();
-        newModel.add(tf.layers.dense({ inputShape: [depth], units: 32, activation: "relu" }));
+        newModel.add(tf.layers.dense({ inputShape: [depth + 4], units: 32, activation: "relu" }));
         newModel.add(tf.layers.dense({ units: 4, activation: "softmax" }));
         newModel.compile({ optimizer: "adam", loss: "categoricalCrossentropy" });
         setModel(newModel);
@@ -78,7 +79,7 @@ export default function MajesticPredictor() {
       target[targetIndex] = 1;
       const outputTensor = tf.tensor2d([target]);
       await model.fit(inputTensor, outputTensor, { epochs: 3 });
-      await model.save("indexeddb://majestic-rp-model-multi");
+      await model.save("indexeddb://majestic-rp-model-miss-aware");
     } finally {
       trainingRef.current = false;
     }
@@ -86,7 +87,10 @@ export default function MajesticPredictor() {
 
   const predictForward = async () => {
     if (!model || session.length < depth) return;
-    const input = session.slice(-depth).map(f => fieldToIndex[f] / 3);
+    const input = [
+      ...session.slice(-depth).map(f => fieldToIndex[f] / 3),
+      ...missCounts.map(c => Math.min(c / 20, 1))
+    ];
     const inputTensor = tf.tensor2d([input]);
     const result = await model.predict(inputTensor).data();
     setPredictions(result);
@@ -95,8 +99,17 @@ export default function MajesticPredictor() {
   const addResult = async (selectedField) => {
     const newSession = [...session, selectedField];
     setSession(newSession);
+
+    const updatedMissCounts = missCounts.map((c, i) =>
+      i === fieldToIndex[selectedField] ? 0 : c + 1
+    );
+    setMissCounts(updatedMissCounts);
+
     if (newSession.length >= depth) {
-      const input = newSession.slice(-depth).map(f => fieldToIndex[f] / 3);
+      const input = [
+        ...newSession.slice(-depth).map(f => fieldToIndex[f] / 3),
+        ...updatedMissCounts.map(c => Math.min(c / 20, 1))
+      ];
       await trainModel(input, fieldToIndex[selectedField]);
       await saveToFirestore({ session: newSession });
       await predictForward();
@@ -118,13 +131,21 @@ export default function MajesticPredictor() {
     snapshot.forEach(doc => {
       const s = doc.data().session;
       if (!Array.isArray(s) || s.length < depth + 1) return;
+
+      let counts = [0, 0, 0, 0];
       for (let i = depth; i < s.length; i++) {
-        const input = s.slice(i - depth, i).map(f => fieldToIndex[f] / 3);
-        const targetIndex = fieldToIndex[s[i]];
+        const inputSeq = s.slice(i - depth, i).map(f => fieldToIndex[f] / 3);
+        const current = fieldToIndex[s[i]];
+        const missInput = counts.map(c => Math.min(c / 20, 1));
+        const input = [...inputSeq, ...missInput];
+
         const target = new Array(4).fill(0);
-        target[targetIndex] = 1;
+        target[current] = 1;
+
         allInputs.push(input);
         allTargets.push(target);
+
+        counts = counts.map((c, idx) => (idx === current ? 0 : c + 1));
       }
     });
 
@@ -132,8 +153,8 @@ export default function MajesticPredictor() {
       const xs = tf.tensor2d(allInputs);
       const ys = tf.tensor2d(allTargets);
       await model.fit(xs, ys, { epochs: 5 });
-      await model.save("indexeddb://majestic-rp-model-multi");
-      alert("Модель обучена на общей истории всех пользователей!");
+      await model.save("indexeddb://majestic-rp-model-miss-aware");
+      alert("Модель обучена с учётом невыпадений!");
     }
   };
 
@@ -161,7 +182,7 @@ export default function MajesticPredictor() {
 
   return (
     <div style={{ fontFamily: "sans-serif", padding: "1rem" }}>
-      <h1>🎯 Majestic RP Predictor (Стабильная версия)</h1>
+      <h1>🎯 Majestic RP Predictor (Невыпадения + обучение)</h1>
       <p>👤 Пользователь: {user.email} <button onClick={signOutUser}>Выйти</button></p>
       <p>🎯 Точность предсказаний: {totalPredictions > 0 ? ((correctPredictions / totalPredictions) * 100).toFixed(1) : 0}%</p>
 
@@ -204,3 +225,4 @@ export default function MajesticPredictor() {
     </div>
   );
 }
+
